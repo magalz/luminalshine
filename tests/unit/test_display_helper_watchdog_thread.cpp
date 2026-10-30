@@ -1,10 +1,12 @@
 /**
  * @file tests/unit/test_display_helper_watchdog_thread.cpp
- * @brief Regression tests for stopping the display helper watchdog thread (issue #212).
+ * @brief Regression tests for stopping the display helper watchdog thread (issues #212, #228, #229).
  *
  * A session teardown or an app termination can run on the watchdog's own loop, so stopping the
  * watchdog must not join the calling thread: that throws std::system_error (EDEADLK) and,
- * uncaught, crashes the host.
+ * uncaught, crashes the host. A stop whose join outlives a newer start must not clean up that
+ * start's state (#229). The #228 fix lives in the host's running hook, which these tests cannot
+ * reach; they keep the self-stop path it still relies on working.
  */
 #include "src/platform/windows/display_helper_watchdog.h"
 
@@ -189,4 +191,144 @@ TEST(DisplayHelperWatchdogThread, SlotStartDuringStopJoinDoesNotBlock) {
   ASSERT_TRUE(restart_returned) << "start() blocked while stop() was joining";
   EXPECT_TRUE(restarter.get());
   EXPECT_TRUE(slot.stop());
+}
+
+TEST(DisplayHelperWatchdogThread, SlotStopRunsCleanupOnlyWhenItStoppedAThread) {
+  display_helper_integration::WatchdogThreadSlot slot;
+  int cleanups = 0;
+  const auto cleanup = [&cleanups] {
+    cleanups += 1;
+  };
+
+  EXPECT_FALSE(slot.stop(cleanup));
+  EXPECT_EQ(cleanups, 0);
+
+  ASSERT_TRUE(slot.start([](std::stop_token token) {
+    while (!token.stop_requested()) {
+      std::this_thread::sleep_for(1ms);
+    }
+  }));
+  EXPECT_TRUE(slot.stop(cleanup));
+  EXPECT_EQ(cleanups, 1);
+  EXPECT_FALSE(slot.stop(cleanup));
+  EXPECT_EQ(cleanups, 1);
+}
+
+// Issue #229: a stop whose join outlives a newer start() must not clean up the newer session's state.
+TEST(DisplayHelperWatchdogThread, SlotStaleStopSkipsCleanupAfterRestart) {
+  display_helper_integration::WatchdogThreadSlot slot;
+  std::promise<void> stop_seen;
+  std::promise<void> release;
+  const auto release_future = release.get_future().share();
+  auto stop_seen_future = stop_seen.get_future();
+  std::atomic<bool> stale_cleanup {false};
+  auto new_exited = std::make_shared<std::atomic<bool>>(false);
+
+  ASSERT_TRUE(slot.start([&stop_seen, release_future](std::stop_token token) {
+    while (!token.stop_requested()) {
+      std::this_thread::sleep_for(1ms);
+    }
+    stop_seen.set_value();
+    release_future.wait();  // keeps the stale stop() inside join() until the restart happened
+  }));
+
+  auto stopper = std::async(std::launch::async, [&slot, &stale_cleanup] {
+    return slot.stop([&stale_cleanup] {
+      stale_cleanup.store(true);
+    });
+  });
+  const bool stop_reached = stop_seen_future.wait_for(kWaitTimeout) == std::future_status::ready;
+  const bool restarted = stop_reached && slot.start([new_exited](std::stop_token token) {
+    while (!token.stop_requested()) {
+      std::this_thread::sleep_for(1ms);
+    }
+    new_exited->store(true);
+  });
+
+  release.set_value();
+  EXPECT_TRUE(stopper.get());
+  ASSERT_TRUE(stop_reached);
+  ASSERT_TRUE(restarted);
+  EXPECT_FALSE(stale_cleanup.load()) << "a stale stop() cleaned up after a newer start()";
+  EXPECT_FALSE(new_exited->load());
+
+  bool current_cleanup = false;
+  EXPECT_TRUE(slot.stop([&current_cleanup] {
+    current_cleanup = true;
+  }));
+  EXPECT_TRUE(current_cleanup);
+  EXPECT_TRUE(new_exited->load());
+}
+
+// Slow stop of the first thread, a start, then a fast stop of the second: only the fast stop, which
+// stopped the most recent start(), cleans up.
+TEST(DisplayHelperWatchdogThread, SlotOnlyStopOfLatestStartCleansUp) {
+  display_helper_integration::WatchdogThreadSlot slot;
+  std::promise<void> stop_seen;
+  std::promise<void> release;
+  const auto release_future = release.get_future().share();
+  auto stop_seen_future = stop_seen.get_future();
+  std::atomic<bool> slow_cleanup {false};
+  bool fast_cleanup = false;
+
+  ASSERT_TRUE(slot.start([&stop_seen, release_future](std::stop_token token) {
+    while (!token.stop_requested()) {
+      std::this_thread::sleep_for(1ms);
+    }
+    stop_seen.set_value();
+    release_future.wait();
+  }));
+
+  auto slow_stopper = std::async(std::launch::async, [&slot, &slow_cleanup] {
+    return slot.stop([&slow_cleanup] {
+      slow_cleanup.store(true);
+    });
+  });
+  const bool stop_reached = stop_seen_future.wait_for(kWaitTimeout) == std::future_status::ready;
+  const bool restarted = stop_reached && slot.start([](std::stop_token token) {
+    while (!token.stop_requested()) {
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+  const bool fast_stopped = restarted && slot.stop([&fast_cleanup] {
+    fast_cleanup = true;
+  });
+
+  release.set_value();
+  EXPECT_TRUE(slow_stopper.get());
+  ASSERT_TRUE(stop_reached);
+  ASSERT_TRUE(restarted);
+  EXPECT_TRUE(fast_stopped);
+  EXPECT_TRUE(fast_cleanup);
+  EXPECT_FALSE(slow_cleanup.load()) << "the stop of an older start() cleaned up after a newer one";
+}
+
+TEST(DisplayHelperWatchdogThread, SlotSelfStopRunsCleanupWithoutSelfJoin) {
+  // The watchdog thread detaches itself, so it only touches shared_ptr-owned state after stop().
+  auto slot = std::make_shared<display_helper_integration::WatchdogThreadSlot>();
+  auto outcome = std::make_shared<std::promise<SelfStopOutcome>>();
+  auto result = outcome->get_future();
+  auto cleaned = std::make_shared<std::atomic<bool>>(false);
+
+  ASSERT_TRUE(slot->start([slot, outcome, cleaned](std::stop_token token) {
+    SelfStopOutcome out;
+    try {
+      out.stopped = slot->stop([cleaned] {
+        cleaned->store(true);
+      });
+    } catch (const std::exception &e) {
+      out.threw = true;
+      out.error = e.what();
+    }
+    out.stop_requested = token.stop_requested();
+    outcome->set_value(std::move(out));
+  }));
+
+  ASSERT_EQ(result.wait_for(kWaitTimeout), std::future_status::ready) << "slot stop did not return on the watchdog thread";
+  const auto out = result.get();
+  EXPECT_FALSE(out.threw) << out.error;
+  EXPECT_TRUE(out.stopped);
+  EXPECT_TRUE(out.stop_requested);
+  EXPECT_TRUE(cleaned->load());
+  EXPECT_FALSE(slot->stop());
 }
