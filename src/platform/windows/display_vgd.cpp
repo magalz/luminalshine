@@ -44,6 +44,7 @@
 #include "src/tdr_state.h"
 #include "src/platform/windows/display_vram.h"
 #include "src/platform/windows/misc.h"
+#include "src/platform/windows/vgd_parent_ring_policy.h"
 #include "src/platform/windows/virtual_display_vgd.h"
 
 #include <luminal_vgd.h>
@@ -309,6 +310,14 @@ namespace platf::dxgi {
     auto target = VDISPLAY::vgd::ring_target_for_display(display_name);
     if (!target) {
       // Not a LuminalVGD monitor (or no live session) — caller falls back.
+      return -1;
+    }
+    // Checked before pre-admission requalification, which can trigger a
+    // planned modeset on the holder's display.
+    namespace ring_consumers = platf::video_worker::ring_consumers;
+    if (ring_consumers::parent_must_skip_ring(ring_consumers::global(), target->session_id, VDISPLAY::vgd::has_worker_ring_target())) {
+      BOOST_LOG(info) << "LuminalVGD capture: ring of session 0x" << std::hex << target->session_id << std::dec
+                      << " is consumed by a live video worker; using fallback capture.";
       return -1;
     }
     if (g_broken_session.load(std::memory_order_acquire) == target->session_id) {

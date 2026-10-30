@@ -4460,6 +4460,11 @@ namespace video {
 
     // Clear any cached display from previous probes to ensure fresh start
     cached_probe_display.reset();
+    // and release it when the probe ends, so the probe's capture source (a
+    // LuminalVGD ring handle included) is not kept open afterwards.
+    auto release_probe_display = util::fail_guard([]() {
+      cached_probe_display.reset();
+    });
 
     auto adjust_encoder_constraints = [&](encoder_t *encoder) {
       // If we can't satisfy both the encoder and codec requirement, prefer the encoder over codec support
