@@ -170,6 +170,10 @@ namespace {
   // a fresh mailbox with the process-wide shutdown event already raised.
   struct EncoderProbeStopTest: testing::Test {
     safe::mail_t saved_mail = mail::man;
+    // The mailbox holds its events by weak_ptr, so an event nobody owns is
+    // recreated, unraised, on the next lookup. main() keeps its shutdown_event
+    // local alive for the same reason; the test has to keep this one alive too.
+    safe::mail_raw_t::event_t<bool> shutdown_event;
     std::array<std::bitset<video::encoder_t::MAX_FLAGS>, 3> saved_capabilities {
       video::software.h264.capabilities,
       video::software.hevc.capabilities,
@@ -190,10 +194,12 @@ namespace {
       video::software.av1.capabilities.set(video::encoder_t::DYNAMIC_RANGE);
 
       mail::man = std::make_shared<safe::mail_raw_t>();
-      mail::man->event<bool>(mail::shutdown)->raise(true);
+      shutdown_event = mail::man->event<bool>(mail::shutdown);
+      shutdown_event->raise(true);
     }
 
     void TearDown() override {
+      shutdown_event.reset();
       mail::man = saved_mail;
       video::software.h264.capabilities = saved_capabilities[0];
       video::software.hevc.capabilities = saved_capabilities[1];
