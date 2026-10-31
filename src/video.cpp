@@ -4059,6 +4059,12 @@ namespace video {
       return true;
     };
 
+    // Acquiring the display below is the slowest step of the first codec, so a
+    // stop that is already pending should not pay for it.
+    if (probe_interrupted()) {
+      return false;
+    }
+
     // First, test encoder viability
     config_t config_max_ref_frames {1920, 1080, 60, 6000, 1000, 1, 1, 1, 0, 0, 0};
     config_t config_autoselect {1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 0};
@@ -4247,6 +4253,13 @@ namespace video {
           flag_map[encoder_t::YUV444] = false;
         }
 
+        // Each attempt can retry validate_config() several times, so look here
+        // rather than only between codecs. The flags are half-written when this
+        // returns; the caller restores them through probe_interrupted().
+        if (probe_stop_requested()) {
+          return;
+        }
+
         // Test 4:2:0 HDR
         config.chromaSamplingType = 0;
         if (disp->is_codec_supported(encoder_codec_name, config) &&
@@ -4268,6 +4281,9 @@ namespace video {
       probe_codec_in_flight = probe_suppression::codec_e::av1;
       test_hdr_and_yuv444(encoder.av1, 2);
       probe_codec_in_flight = probe_suppression::codec_e::unattributed;
+      if (probe_interrupted()) {
+        return false;
+      }
     }
 
     encoder.h264[encoder_t::VUI_PARAMETERS] = encoder.h264[encoder_t::VUI_PARAMETERS] && !config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
@@ -4437,6 +4453,15 @@ namespace video {
       encoder_probe_attempted.store(true, std::memory_order_release);
       BOOST_LOG(debug) << "Encoder probe skipped (cached success).";
       return 0;
+    }
+
+    // Each gate below costs a D3D11 device creation or records a negative cache
+    // entry, and the probe after them is the slow part. A stop that is already
+    // pending has no use for either, and an abandoned probe is neither a failure
+    // to remember nor an attempted probe.
+    if (probe_stop_requested()) {
+      BOOST_LOG(info) << "Encoder probe skipped: shutdown requested"sv;
+      return -1;
     }
 
     // A dead display stack fails every encoder identically, and each

@@ -1034,7 +1034,6 @@ int main(int argc, char *argv[]) {
       std::this_thread::sleep_for(100ms);
     }
     probe_thread.join();
-    if (shutdown_event->peek()) return lifetime::desired_exit_code;
   }
 
   // A stop that arrived during the encoder probe or the PyroWave wait leaves
