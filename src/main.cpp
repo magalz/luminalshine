@@ -868,8 +868,11 @@ int main(int argc, char *argv[]) {
     }
 
     bool encoder_probe_succeeded = false;
-    auto cleanup_encoder_probe_display = util::fail_guard([&encoder_probe_display_result, &encoder_probe_succeeded]() {
-      VDISPLAY::cleanup_ensure_display(encoder_probe_display_result, encoder_probe_succeeded, true);
+    auto cleanup_encoder_probe_display = util::fail_guard([&encoder_probe_display_result, &encoder_probe_succeeded, &shutdown_event]() {
+      // Nothing retries the probe once a stop is requested, so remove the
+      // temporary display now instead of keeping it for a retry that cannot
+      // happen and leaving it to the driver's crash backstop after exit.
+      VDISPLAY::cleanup_ensure_display(encoder_probe_display_result, encoder_probe_succeeded || shutdown_event->peek(), true);
     });
 
     if (shutdown_event->peek()) {
