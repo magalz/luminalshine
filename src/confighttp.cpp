@@ -103,6 +103,9 @@
 #endif
 #include "display_helper_integration.h"
 #include "process.h"
+#include "rtsp.h"
+#include "session_lifecycle_coordinator.h"
+#include "stream.h"
 #include "utility.h"
 #include "uuid.h"
 
@@ -3255,11 +3258,52 @@ namespace confighttp {
       );
       return;
     }
+
+    // Starting the capture applies the display and, if the start fails, reverts it.
+    // Take the lease a Moonlight /launch takes so that cannot overlap a Moonlight
+    // launch or last-session teardown, which would otherwise wipe the display state
+    // this session just applied (#234). A Moonlight launch arriving meanwhile gets
+    // its retryable 503. It is taken after the pre-check above, because that
+    // session_count() reaps STOPPING sessions and the join needs cleanup ownership,
+    // and before webrtc_capture.mutex inside the start, which nvhttp's preempt waits
+    // on while holding the lease. The static mutex keeps concurrent browser starts
+    // queued behind each other, as that capture mutex did, instead of refusing one.
+    static std::mutex browser_start_mutex;
+    std::lock_guard browser_start_lock {browser_start_mutex};
+    auto lifecycle_lease = stream::lifecycle::coordinator().acquire_launch(8s);
+    if (!lifecycle_lease) {
+      BOOST_LOG(warning) << "WebRTC: refusing a browser session while a Moonlight launch or teardown owns display preparation.";
+      service_unavailable(
+        response,
+        "The host is still preparing or restoring the display for another stream. Wait a few seconds and connect again."
+      );
+      return;
+    }
+    bool session_started = false;
+    auto abort_guard = util::fail_guard([&]() {
+      if (session_started) {
+        return;
+      }
+      // Release launch ownership first, then take cleanup ownership: if a Moonlight
+      // teardown yielded to this start, acquiring it carries its deferred obligation.
+      lifecycle_lease->reset();
+      auto cleanup = stream::lifecycle::coordinator().acquire_cleanup(8s);
+      if (cleanup.result == stream::lifecycle::cleanup_acquire_result_e::acquired &&
+          cleanup.deferred_cleanup_pending) {
+        stream::session::complete_deferred_global_cleanup("aborted WebRTC session start");
+      }
+    });
+
     if (auto error = webrtc_stream::ensure_capture_started(options)) {
 #ifdef _WIN32
       // Lifecycle gap: if capture start fails after a virtual display was created/applied but
-      // before a session exists, ensure we don't leave the virtual display behind.
-      if (rtsp_stream::session_count() == 0 && !webrtc_stream::has_active_sessions()) {
+      // before a session exists, ensure we don't leave the virtual display behind. Not
+      // rtsp_stream::session_count(): it would reap under this lease (see above).
+      const bool no_active_sessions = stream::lifecycle::capture_is_logically_idle(
+        stream::session::active_sessions.load(std::memory_order_acquire),
+        webrtc_stream::has_active_sessions()
+      );
+      if (no_active_sessions) {
         (void) platf::virtual_display_cleanup::run(
           "webrtc_session_start_failed",
           config::video.dd.config_revert_on_disconnect
@@ -3275,6 +3319,10 @@ namespace confighttp {
       service_unavailable(response, "Shutdown in progress");
       return;
     }
+    // The browser session owns the display now: a Moonlight teardown that yielded
+    // to this start must not run once the lease is released.
+    lifecycle_lease->mark_started();
+    session_started = true;
     BOOST_LOG(info) << "WebRTC: session created id=" << session->id
                     << " codec=" << session->codec.value_or("h264")
                     << " hdr=" << (session->hdr.value_or(false) ? "yes" : "no")

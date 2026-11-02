@@ -2887,6 +2887,15 @@ namespace webrtc_stream {
     }
 
     void stop_webrtc_capture_locked(bool allow_platform_teardown) {
+      // Cleared last, after the display teardown below, and on every exit. nvhttp's
+      // preempt keys on capture_active(): while it is still true the preempt calls
+      // stop_webrtc_capture_if_idle() and waits on webrtc_capture.mutex (held by all
+      // callers of this function) until the teardown ends. Cleared earlier, a
+      // Moonlight launch would skip that wait and apply its display while the
+      // revert of this capture was still running.
+      auto clear_active = util::fail_guard([]() {
+        webrtc_capture.active.store(false, std::memory_order_release);
+      });
       if (webrtc_capture.mail) {
         auto shutdown_event = webrtc_capture.mail->event<bool>(mail::shutdown);
         shutdown_event->raise(true);
@@ -2918,7 +2927,6 @@ namespace webrtc_stream {
       webrtc_capture.config_key.reset();
       webrtc_capture.stream_start_params.reset();
       webrtc_capture.idle_shutdown_pending.store(false, std::memory_order_release);
-      webrtc_capture.active.store(false, std::memory_order_release);
 
 #ifdef _WIN32
       if (allow_platform_teardown) {
