@@ -7,7 +7,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <memory>
+#include <thread>
 
 using namespace std::chrono_literals;
 
@@ -207,6 +209,50 @@ namespace {
 
     EXPECT_FALSE(duplicate.has_value());
     EXPECT_LT(elapsed, 250ms);
+  }
+
+  // The browser (WebRTC) session start takes the same launch lease as a Moonlight
+  // /launch (confighttp createWebRTCSession). These pin the coordinator contract
+  // that start relies on; they pass against the unchanged coordinator.
+  TEST(SessionLifecycleCoordinator, BrowserStartWaitsForInFlightCleanupThenExcludesRivals) {
+    coordinator_t coordinator;
+    auto cleanup = coordinator.acquire_cleanup(0ms);
+    ASSERT_EQ(cleanup.result, cleanup_acquire_result_e::acquired);
+    ASSERT_TRUE(cleanup.lease.has_value());
+
+    std::atomic<bool> cleanup_released {false};
+    std::atomic<bool> released_before_acquire {false};
+    std::optional<coordinator_t::launch_lease_t> browser;
+    std::thread browser_start([&] {
+      browser = coordinator.acquire_launch(5s);
+      released_before_acquire = cleanup_released.load();
+    });
+
+    std::this_thread::sleep_for(50ms);
+    cleanup_released = true;
+    cleanup.lease.reset();
+    browser_start.join();
+
+    // The start only gets the display after the previous session's teardown ended.
+    ASSERT_TRUE(browser.has_value());
+    EXPECT_TRUE(released_before_acquire.load());
+
+    // While the browser start owns the display, a Moonlight launch is refused at
+    // once (retryable 503) and a Moonlight teardown yields instead of racing it.
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_FALSE(coordinator.acquire_launch(2s).has_value());
+    EXPECT_LT(std::chrono::steady_clock::now() - started, 250ms);
+    const auto rival_cleanup = coordinator.acquire_cleanup(0ms);
+    EXPECT_EQ(rival_cleanup.result, cleanup_acquire_result_e::superseded_by_launch);
+    EXPECT_FALSE(rival_cleanup.lease.has_value());
+
+    // A started browser session absorbs the yielded teardown, so nothing reverts
+    // the display it now owns.
+    browser->mark_started();
+    browser.reset();
+    auto later = coordinator.acquire_cleanup(0ms);
+    ASSERT_EQ(later.result, cleanup_acquire_result_e::acquired);
+    EXPECT_FALSE(later.deferred_cleanup_pending);
   }
 
 }  // namespace
