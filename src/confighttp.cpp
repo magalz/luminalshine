@@ -3266,10 +3266,9 @@ namespace confighttp {
     // its retryable 503. It is taken after the pre-check above, because that
     // session_count() reaps STOPPING sessions and the join needs cleanup ownership,
     // and before webrtc_capture.mutex inside the start, which nvhttp's preempt waits
-    // on while holding the lease. The static mutex keeps concurrent browser starts
-    // queued behind each other, as that capture mutex did, instead of refusing one.
-    static std::mutex browser_start_mutex;
-    std::lock_guard browser_start_lock {browser_start_mutex};
+    // on while holding the lease. This handler runs on the web server's single I/O
+    // thread (thread_pool_size is never raised), so a start waits at most 8 s for the
+    // lease here and the failure cleanup below may wait 8 s more.
     auto lifecycle_lease = stream::lifecycle::coordinator().acquire_launch(8s);
     if (!lifecycle_lease) {
       BOOST_LOG(warning) << "WebRTC: refusing a browser session while a Moonlight launch or teardown owns display preparation.";
