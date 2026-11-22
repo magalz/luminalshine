@@ -32,6 +32,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "control_termination_policy.h"
 #include "display_helper_integration.h"
 #include "globals.h"
 #include "input.h"
@@ -407,6 +408,10 @@ namespace stream {
     // ENet peer to session mapping for sessions with a peer connected
     sync_util::sync_t<std::map<net::peer_t, session_t *>> _peer_to_session;
 
+    // Peers of erased sessions still in a graceful disconnect. Only the control broadcast
+    // thread touches it (iterate and its stopping-session cleanup), so it needs no lock.
+    control_termination::detached_peers_t<net::peer_t, std::chrono::steady_clock::time_point> _detached_peers;
+
     ENetAddress _addr;
     net::host_t _host;
   };
@@ -592,6 +597,8 @@ namespace stream {
     safe::signal_t controlEnd;
 
     std::atomic<session::state_e> state;
+    /// First cause passed to session::stop; count_ until then.
+    std::atomic<session::stop_reason_e> stop_reason {session::stop_reason_e::count_};
 
 #ifdef _WIN32
     struct {
@@ -907,6 +914,24 @@ namespace stream {
     auto res = enet_host_service(_host.get(), &event, (enet_uint32) timeout.count());
 
     if (res > 0) {
+      // A detached peer's events must not reach session lookup, which could bind the peer to a
+      // new pending session from the same client or reject it with a disconnect.
+      const auto peer_event = event.type == ENET_EVENT_TYPE_CONNECT ? control_termination::peer_event_e::connect :
+                              event.type == ENET_EVENT_TYPE_RECEIVE ? control_termination::peer_event_e::receive :
+                                                                      control_termination::peer_event_e::disconnect;
+      const auto detached_since = _detached_peers.detached_since(event.peer);
+      if (_detached_peers.consume(event.peer, peer_event)) {
+        if (event.type == ENET_EVENT_TYPE_RECEIVE) {
+          enet_packet_destroy(event.packet);
+        } else {
+          // About one RTT means the client acked the termination; seconds mean an ENet timeout.
+          BOOST_LOG(debug) << "Detached control peer closed: peer=["sv << platf::from_sockaddr((sockaddr *) &event.peer->address.address)
+                           << "] after "sv << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - *detached_since).count()
+                           << " ms"sv;
+        }
+        return;
+      }
+
       auto session = get_session(event.peer, event.data);
       if (!session) {
         BOOST_LOG(warning) << "Rejected connection from ["sv << platf::from_sockaddr((sockaddr *) &event.peer->address.address) << "]: it's not properly set up"sv;
@@ -1278,6 +1303,27 @@ namespace stream {
     return 0;
   }
 
+  /// Queues IDX_TERMINATION with @p reason to the session's control peer. The caller flushes.
+  static int send_control_termination(control_server_t *server, session_t *session, std::uint32_t reason) {
+    control_terminate_t plaintext;
+    plaintext.header.type = packetTypes[IDX_TERMINATION];
+    plaintext.header.payloadLength = sizeof(plaintext.ec);
+    plaintext.ec = util::endian::big<uint32_t>(reason);
+
+    std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+      encrypted_payload;
+
+    auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
+    if (server->send(payload, session->control.peer)) {
+      TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+      BOOST_LOG(warning) << "Couldn't send termination code to ["sv << addr << ':' << port << ']';
+
+      return -1;
+    }
+
+    return 0;
+  }
+
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
@@ -1565,14 +1611,45 @@ namespace stream {
             pos = server->_sessions->erase(pos);
 
             if (session->control.peer) {
+              // ENet can hand a freed peer slot to a new connection, so a connected peer only
+              // counts if the slot still maps to this session.
+              bool owns_peer = false;
               {
                 auto ptslg = server->_peer_to_session.lock();
+                auto it = server->_peer_to_session->find(session->control.peer);
+                owns_peer = it != server->_peer_to_session->end() && it->second == session;
                 server->_peer_to_session->erase(session->control.peer);
               }
 
-              BOOST_LOG(info) << "Disconnecting control peer of stopping session: peer="sv << session->control.peer_address
-                              << ' ' << session_label(*session);
-              enet_peer_disconnect_now(session->control.peer, 0);
+              // A host-initiated stop (/cancel, a Web UI disconnect, RTSP teardown) tells a
+              // still-connected client it ended on purpose; otherwise the client reports the
+              // disconnect as an error. The client's ENet drops undispatched packets when a
+              // DISCONNECT arrives, so enet_peer_disconnect_later asks ENet to send it only after
+              // the termination is acked; the peer stays detached until ENet reports its DISCONNECT.
+              // Teardown does not wait: when the last session ends, the host can be destroyed
+              // before the ack, leaving only the flushed datagram. Like the shutdown loop this is
+              // best effort, and still strictly better than enet_peer_disconnect_now.
+              const auto reason = session->stop_reason.load(std::memory_order_acquire);
+              const bool peer_connected = owns_peer && session->control.peer->state == ENET_PEER_STATE_CONNECTED;
+              bool termination_queued = false;
+              if (control_termination::should_send_graceful_termination(reason, peer_connected)) {
+                BOOST_LOG(info) << "Sending control termination "sv << util::log_hex(control_termination::graceful_termination_code)
+                                << " before disconnect: reason="sv << session::stop_reason_name(reason)
+                                << " peer="sv << session->control.peer_address << ' ' << session_label(*session);
+                termination_queued = !send_control_termination(server, session, control_termination::graceful_termination_code);
+              }
+
+              if (termination_queued) {
+                BOOST_LOG(info) << "Disconnecting control peer of stopping session once the termination is acked: peer="sv
+                                << session->control.peer_address << ' ' << session_label(*session);
+                server->_detached_peers.add(session->control.peer, std::chrono::steady_clock::now());
+                enet_peer_disconnect_later(session->control.peer, 0);
+                server->flush();
+              } else {
+                BOOST_LOG(info) << "Disconnecting control peer of stopping session: peer="sv << session->control.peer_address
+                                << ' ' << session_label(*session);
+                enet_peer_disconnect_now(session->control.peer, 0);
+              }
             }
 
             session->controlEnd.raise(true);
@@ -1653,15 +1730,7 @@ namespace stream {
 
     // Let all remaining connections know the server is shutting down
     // reason: graceful termination
-    std::uint32_t reason = 0x80030023;
-
-    control_terminate_t plaintext;
-    plaintext.header.type = packetTypes[IDX_TERMINATION];
-    plaintext.header.payloadLength = sizeof(plaintext.ec);
-    plaintext.ec = util::endian::big<uint32_t>(reason);
-
-    std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
-      encrypted_payload;
+    std::uint32_t reason = control_termination::graceful_termination_code;
 
     auto lg = server->_sessions.lock();
     BOOST_LOG(info) << "Control thread exiting; terminating "sv << server->_sessions->size()
@@ -1677,12 +1746,7 @@ namespace stream {
 
       // We may not have gotten far enough to have an ENet connection yet
       if (session->control.peer) {
-        auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
-
-        if (server->send(payload, session->control.peer)) {
-          TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
-          BOOST_LOG(warning) << "Couldn't send termination code to ["sv << addr << ':' << port << ']';
-        }
+        send_control_termination(server, session, reason);
       }
 
       session->shutdown_event->raise(true);
@@ -2998,6 +3062,16 @@ namespace stream {
 
     void stop(session_t &session, stop_reason_e reason, std::source_location loc) {
       while_starting_do_nothing(session.state);
+      // Record the cause before publishing STOPPING, so a thread that sees STOPPING also sees
+      // why. With concurrent callers the first one's reason is kept. Only a RUNNING session
+      // records one: a stop before start must not leave a stale reason for the real one.
+      // If start stores RUNNING between this check and the state CAS below, the CAS still
+      // stops the session but no reason is recorded; that only skips the graceful
+      // termination message, which is the safe direction.
+      if (session.state.load(std::memory_order_acquire) == state_e::RUNNING) {
+        auto unrecorded = stop_reason_e::count_;
+        session.stop_reason.compare_exchange_strong(unrecorded, reason);
+      }
       auto expected = state_e::RUNNING;
       auto already_stopping = !session.state.compare_exchange_strong(expected, state_e::STOPPING);
       if (already_stopping) {
@@ -3015,8 +3089,12 @@ namespace stream {
 
       // Written once per session, on the transition only: which session stopped, why,
       // and from where, so a client that ends up disconnected is never left unexplained.
+      // reason= is the recorded one the control thread acts on; with racing stops it can
+      // differ from this caller's, which is then logged too.
+      const auto recorded_reason = session.stop_reason.load(std::memory_order_acquire);
+      const auto caller_reason = recorded_reason != reason ? " caller_reason="s + stop_reason_name(reason) : ""s;
       BOOST_LOG(info) << "Session stop: "sv << describe(identity(session))
-                      << " reason="sv << stop_reason_name(reason)
+                      << " reason="sv << stop_reason_name(recorded_reason) << caller_reason
                       << " at "sv << file_basename(loc.file_name()) << ':' << loc.line()
                       << " (active sessions now "sv << remaining_active << ')';
 
